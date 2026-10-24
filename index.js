@@ -181,7 +181,7 @@ bot.command('weekly', 'Claim weekly Gems', async msg => {
 
 bot.command('work', 'Earn Gems', async msg => {
   const u = user(idOf(msg));
-  const wait = cooldownMessage(u.work, HOUR);
+  const wait = cooldownMessage(Number(u.work) || 0, HOUR);
   if (wait) return reply(msg, wait);
   const earned = Math.floor(Math.random() * 51) + 25;
   addGems(u, earned);
