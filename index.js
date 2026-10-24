@@ -5,19 +5,50 @@ import { readFile, writeFile } from 'node:fs/promises';
 const bot = new Bot(process.env.YAPPER_BOT_TOKEN);
 const DB_FILE = './economy.json';
 const DAY = 86400000;
+const WEEK = 7 * DAY;
+const MONTH = 30 * DAY;
 const HOUR = 3600000;
-const ADMIN_IDS = (process.env.ADMIN_IDS || '')
-  .split(',').map(x => x.trim()).filter(Boolean);
+const ADMIN_IDS = new Set(
+  (process.env.ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
+);
+
+const YELLOW = '#FFD000';
+
+const SHOP_ITEMS = {
+  apple: { name: 'Apple', price: 20, description: 'A crunchy snack.' },
+  potion: { name: 'Lucky Potion', price: 150, description: 'A collectible potion.' },
+  gem: { name: 'Shiny Gem', price: 250, description: 'A shiny collectible.' },
+  egg: { name: 'Basic Egg', price: 100, description: 'Hatch a random pet.' },
+  goldenegg: { name: 'Golden Egg', price: 500, description: 'Hatch a rarer pet.' }
+};
+
+const PETS = {
+  Cat: { rarity: 'Common', value: 50 },
+  Dog: { rarity: 'Common', value: 50 },
+  Bunny: { rarity: 'Common', value: 60 },
+  Fox: { rarity: 'Rare', value: 180 },
+  Panda: { rarity: 'Rare', value: 200 },
+  Dragon: { rarity: 'Epic', value: 500 },
+  Phoenix: { rarity: 'Legendary', value: 1200 }
+};
+
+const EGG_TABLES = {
+  egg: [['Cat', 30], ['Dog', 30], ['Bunny', 25], ['Fox', 10], ['Panda', 4], ['Dragon', 1]],
+  goldenegg: [['Fox', 25], ['Panda', 30], ['Dragon', 30], ['Phoenix', 15]]
+};
 
 let db = { users: {}, maintenance: false };
+
 try {
-  db = { ...db, ...JSON.parse(await readFile(DB_FILE, 'utf8')) };
+  db = JSON.parse(await readFile(DB_FILE, 'utf8'));
   db.users ||= {};
+  db.maintenance ||= false;
 } catch (e) {
   if (e.code !== 'ENOENT') throw e;
 }
 
 let saveQueue = Promise.resolve();
+
 function save() {
   saveQueue = saveQueue.then(() =>
     writeFile(DB_FILE, JSON.stringify(db, null, 2))
@@ -25,446 +56,541 @@ function save() {
   return saveQueue;
 }
 
-function idOf(msg) {
-  return msg.authorMention;
+function uid(msg) {
+  return String(msg.author_id || msg.user_id || '').trim();
 }
-function user(id) {
+
+function userFor(id) {
   db.users[id] ||= {
-    balance: 0, bank: 0, daily: 0, weekly: 0, work: 0,
-    inventory: {}, pets: [], discoveries: [], achievements: [],
-    region: 'Unspecified', stats: { earned: 0, spent: 0 },
-    created: Date.now()
+    balance: 0,
+    lastDaily: 0,
+    lastWeekly: 0,
+    lastWork: 0,
+    createdAt: Date.now(),
+    history: [],
+    inventory: {},
+    pets: [],
+    achievements: [],
+    region: 'unset',
+    stats: { earned: 0, spent: 0, games: 0, wins: 0, discoveries: [] }
   };
+
   const u = db.users[id];
+  u.history ||= [];
   u.inventory ||= {};
   u.pets ||= [];
-  u.discoveries ||= [];
   u.achievements ||= [];
-  u.stats ||= { earned: 0, spent: 0 };
+  u.region ||= 'unset';
+  u.stats ||= { earned: 0, spent: 0, games: 0, wins: 0, discoveries: [] };
+  u.stats.discoveries ||= [];
   return u;
 }
-function money(n) {
-  return Math.floor(n).toLocaleString('en-US');
+
+function getUser(msg) {
+  const id = uid(msg);
+  if (!id) throw new Error('Could not identify your Yapper user ID.');
+  return userFor(id);
 }
-function reply(msg, text) {
-  return msg.reply(text);
+
+function fmt(n) {
+  return Math.floor(Number(n) || 0).toLocaleString('en-US');
 }
-function mentionId(s) {
-  return s?.match(/^<@!?(\d+)>$/)?.[1]
-    ? `<@${s.match(/^<@!?(\d+)>$/)[1]}>`
-    : s;
+
+function args(msg) {
+  return (msg.args || '').trim().split(/\s+/).filter(Boolean);
 }
+
+function targetId(raw) {
+  return String(raw || '').replace(/^<@!?/, '').replace(/>$/, '');
+}
+
 function isAdmin(msg) {
-  const raw = idOf(msg).replace(/[<@!>]/g, '');
-  return ADMIN_IDS.includes(raw) || ADMIN_IDS.includes(idOf(msg));
+  return ADMIN_IDS.has(uid(msg));
 }
-function adminOnly(msg) {
-  return isAdmin(msg) || reply(msg, '⛔ Admin only.');
+
+function maintenanceBlocked(msg) {
+  return db.maintenance && !isAdmin(msg);
 }
-function addGems(u, amount) {
-  u.balance += amount;
-  if (amount > 0) u.stats.earned += amount;
+
+function record(u, delta) {
+  u.balance += delta;
+  u.stats.earned += Math.max(0, delta);
+  u.stats.spent += Math.max(0, -delta);
+  u.history.push({ at: Date.now(), delta });
+  if (u.history.length > 3000) u.history = u.history.slice(-3000);
 }
-function cooldownMessage(last, duration) {
+
+function card(msg, title, description, fields = []) {
+  const embed = new Embed()
+    .title(`🔐 ${title}`)
+    .description(description)
+    .color(YELLOW)
+    .footer('Vaulty • Earn • Play • Grow')
+    .timestamp();
+
+  for (const f of fields) {
+    embed.field(f[0], String(f[1]), f[2] ?? false);
+  }
+
+  return msg.reply('', { embeds: [embed] });
+}
+
+function errorCard(msg, description) {
+  return card(msg, 'Something went wrong', `⚠️ ${description}`);
+}
+
+function rewardCard(msg, title, amount, balance, extra = '') {
+  return card(
+    msg,
+    title,
+    `💰 You received **${fmt(amount)} Gems**!`,
+    [['Your Balance', `${fmt(balance)} Gems`, true]]
+  );
+}
+
+function weightedPick(table) {
+  let n = Math.random() * table.reduce((s, x) => s + x[1], 0);
+  for (const [name, weight] of table) {
+    n -= weight;
+    if (n <= 0) return name;
+  }
+  return table[0][0];
+}
+
+function grantAchievement(u, key, title) {
+  if (u.achievements.includes(key)) return '';
+  u.achievements.push(key);
+  return `\n🏅 Achievement unlocked: **${title}**!`;
+}
+
+function cooldownMessage(last, duration, label) {
   const timestamp = Number(last) || 0;
-  const wait = duration - (Date.now() - timestamp);
-
-  if (wait <= 0) return null;
-
-  const hours = Math.ceil(wait / 3600000);
-  return `⏳ Try again in ${hours} hour(s).`;
+  const left = duration - (Date.now() - timestamp);
+  if (left <= 0) return null;
+  return `⏳ ${label} ready in about ${Math.ceil(left / HOUR)} hour(s).`;
 }
 
-const ITEMS = {
-  apple: { name: 'Apple', price: 20, sell: 8, type: 'food' },
-  potion: { name: 'Lucky Potion', price: 150, sell: 60, type: 'use' },
-  egg: { name: 'Common Egg', price: 100, sell: 40, type: 'egg' },
-  goldenegg: { name: 'Golden Egg', price: 500, sell: 200, type: 'egg' },
-  ticket: { name: 'Lottery Ticket', price: 75, sell: 20, type: 'use' }
-};
-
-const PETS = [
-  { name: 'Cat', rarity: 'Common', chance: 40, value: 50 },
-  { name: 'Dog', rarity: 'Common', chance: 30, value: 60 },
-  { name: 'Rabbit', rarity: 'Uncommon', chance: 17, value: 100 },
-  { name: 'Fox', rarity: 'Rare', chance: 8, value: 250 },
-  { name: 'Dragon', rarity: 'Legendary', chance: 4, value: 1000 },
-  { name: 'Phoenix', rarity: 'Mythic', chance: 1, value: 2500 }
-];
-
-function pickPet() {
-  let roll = Math.random() * 100;
-  for (const p of PETS) {
-    roll -= p.chance;
-    if (roll <= 0) return { ...p, uid: `${Date.now()}-${Math.random()}` };
-  }
-  return { ...PETS[0], uid: `${Date.now()}-${Math.random()}` };
-}
-
-function checkAchievements(u) {
-  const checks = [
-    ['First Gems', u.balance >= 100],
-    ['Getting Rich', u.balance >= 1000],
-    ['Gem Millionaire', u.balance >= 1000000],
-    ['Pet Collector', u.pets.length >= 5],
-    ['Explorer', u.discoveries.length >= 5]
-  ];
-  const unlocked = [];
-  for (const [name, yes] of checks) {
-    if (yes && !u.achievements.includes(name)) {
-      u.achievements.push(name);
-      unlocked.push(name);
-    }
-  }
-  return unlocked;
-}
-
-bot.command('ping', 'Check bot status', msg =>
-  reply(msg, '🏓 Pong! The bot is online.')
-);
-
-bot.command('help', 'Show all commands', msg => reply(msg,
-`💎 ECONOMY
-/balance, /daily, /weekly, /work
-/transfer @user amount
-/profile, /region name
-/leaderboard [weekly|monthly|alltime]
-/richest
-
-🥚 PETS
-/eggs, /hatch [egg|goldenegg]
-/pets, /pet number, /sellpet number
-/collection, /discoveries
-
-🛒 SHOP
-/shop, /buy item [amount]
-/inventory, /sell item [amount], /use item
-
-🎮 GAMES
-/coinflip amount heads|tails
-/slots amount
-
-🏅 PROGRESS
-/achievements
-
-🛠️ ADMIN
-/addgems @user amount
-/removegems @user amount
-/setgems @user amount
-/giveegg @user [goldenegg]
-/maintenance on|off
-
-/help, /ping`
-));
-
-bot.command('balance', 'Check Gems', msg => {
-  const u = user(idOf(msg));
-  return reply(msg, `💎 Wallet: ${money(u.balance)} Gems\n🏦 Bank: ${money(u.bank)} Gems`);
+// BALANCE AND REWARDS
+bot.command('balance', 'Check your Gems balance', msg => {
+  const u = getUser(msg);
+  return card(msg, 'Your Balance', `💎 **${fmt(u.balance)} Gems**`);
 });
 
-bot.command('daily', 'Claim daily Gems', async msg => {
-  if (db.maintenance && !isAdmin(msg)) return reply(msg, '🔧 Maintenance mode is on.');
-  const u = user(idOf(msg));
-  const wait = cooldownMessage(u.daily, DAY);
-  if (wait) return reply(msg, wait);
-  addGems(u, 100);
-  u.daily = Date.now();
+bot.command('daily', 'Claim 100 Gems every 24 hours', async msg => {
+  if (maintenanceBlocked(msg)) return errorCard(msg, 'The economy is in maintenance mode.');
+  const u = getUser(msg);
+  const wait = cooldownMessage(u.lastDaily, DAY, 'Daily reward');
+  if (wait) return errorCard(msg, wait);
+  record(u, 100);
+  u.lastDaily = Date.now();
+  const achievement = grantAchievement(u, 'first_daily', 'Daily Starter');
   await save();
-  return reply(msg, `💎 You claimed 100 Gems! Balance: ${money(u.balance)}`);
+  return card(msg, 'Daily Reward', `🎁 You claimed **100 Gems**!${achievement}`, [
+    ['Balance', `${fmt(u.balance)} Gems`, true]
+  ]);
 });
 
-bot.command('weekly', 'Claim weekly Gems', async msg => {
-  const u = user(idOf(msg));
-  const wait = cooldownMessage(u.weekly, 7 * DAY);
-  if (wait) return reply(msg, wait);
-  addGems(u, 500);
-  u.weekly = Date.now();
+bot.command('weekly', 'Claim 500 Gems every 7 days', async msg => {
+  if (maintenanceBlocked(msg)) return errorCard(msg, 'The economy is in maintenance mode.');
+  const u = getUser(msg);
+  const left = WEEK - (Date.now() - (Number(u.lastWeekly) || 0));
+  if (left > 0) return errorCard(msg, `Weekly reward ready in about ${Math.ceil(left / DAY)} day(s).`);
+  record(u, 500);
+  u.lastWeekly = Date.now();
   await save();
-  return reply(msg, `🎁 You claimed 500 Gems! Balance: ${money(u.balance)}`);
+  return card(msg, 'Weekly Reward', '🎁 You claimed **500 Gems**!', [
+    ['Balance', `${fmt(u.balance)} Gems`, true]
+  ]);
 });
 
-bot.command('work', 'Earn Gems', async msg => {
-  const u = user(idOf(msg));
-  const wait = cooldownMessage(Number(u.work) || 0, HOUR);
-  if (wait) return reply(msg, wait);
-  const earned = Math.floor(Math.random() * 51) + 25;
-  addGems(u, earned);
-  u.work = Date.now();
+bot.command('work', 'Earn 25–75 Gems every hour', async msg => {
+  if (maintenanceBlocked(msg)) return errorCard(msg, 'The economy is in maintenance mode.');
+  const u = getUser(msg);
+  const wait = HOUR - (Date.now() - (Number(u.lastWork) || 0));
+  if (wait > 0) return errorCard(msg, `You can work again in ${Math.ceil(wait / 60000)} minute(s).`);
+  const earned = 25 + Math.floor(Math.random() * 51);
+  record(u, earned);
+  u.lastWork = Date.now();
+  const achievement = grantAchievement(u, 'first_work', 'Hard Worker');
   await save();
-  return reply(msg, `🛠️ You earned ${earned} Gems!`);
+  return card(msg, 'Work Complete', `🛠️ You earned **${earned} Gems**!${achievement}`, [
+    ['Balance', `${fmt(u.balance)} Gems`, true]
+  ]);
 });
 
-bot.command('transfer', 'Transfer Gems', async msg => {
-  const [targetRaw, amountRaw] = msg.argv || [];
-  const target = mentionId(targetRaw);
+bot.command('transfer', 'Transfer Gems: /transfer @user amount', async msg => {
+  const [raw, amountRaw] = args(msg);
+  const id = targetId(raw);
   const amount = Number(amountRaw);
-  if (!target || !Number.isSafeInteger(amount) || amount <= 0)
-    return reply(msg, 'Use /transfer @user amount');
-  if (target === idOf(msg)) return reply(msg, '❌ You cannot pay yourself.');
-  const u = user(idOf(msg));
-  if (u.balance < amount) return reply(msg, '❌ Not enough Gems.');
-  u.balance -= amount;
-  user(target).balance += amount;
+  if (!id || !Number.isSafeInteger(amount) || amount <= 0) return errorCard(msg, 'Usage: `/transfer @user amount`.');
+  if (id === uid(msg)) return errorCard(msg, "You can't transfer Gems to yourself.");
+  if (!db.users[id] && !/^\d+$/.test(id)) return errorCard(msg, 'Mention a valid user.');
+  const sender = getUser(msg);
+  if (sender.balance < amount) return errorCard(msg, "You don't have enough Gems.");
+  const recipient = userFor(id);
+  record(sender, -amount);
+  record(recipient, amount);
   await save();
-  return reply(msg, `✅ Sent ${money(amount)} Gems to ${target}.`);
+  return card(msg, 'Transfer Complete', `💸 Sent **${fmt(amount)} Gems** to <@${id}>.`);
 });
 
-bot.command('profile', 'View your profile', msg => {
-  const u = user(idOf(msg));
-  return reply(msg,
-`👤 Profile: ${idOf(msg)}
-💎 Wallet: ${money(u.balance)}
-🏦 Bank: ${money(u.bank)}
-🥚 Pets: ${u.pets.length}
-🏅 Achievements: ${u.achievements.length}
-🌍 Region: ${u.region}`);
-});
+// LEADERBOARDS
+bot.command('leaderboard', 'Usage: /leaderboard alltime|weekly|monthly world|region', msg => {
+  const a = args(msg);
+  const period = ['weekly', 'monthly', 'alltime'].includes((a[0] || '').toLowerCase())
+    ? a[0].toLowerCase() : 'alltime';
+  const scope = (a[1] || 'world').toLowerCase();
+  const me = getUser(msg);
+  let rows = Object.entries(db.users);
 
-bot.command('region', 'Set your region', async msg => {
-  const region = (msg.args || '').trim().slice(0, 30);
-  if (!region) return reply(msg, 'Use /region Europe (or your region name).');
-  user(idOf(msg)).region = region;
-  await save();
-  return reply(msg, `🌍 Your region is now ${region}.`);
-});
-
-bot.command('leaderboard', 'View richest players', msg => {
-  const mode = (msg.argv?.[0] || 'alltime').toLowerCase();
-  const all = Object.entries(db.users);
-  let list = all;
-  if (mode === 'weekly') list = all.filter(([,u]) => u.weekly && Date.now()-u.weekly < 7*DAY);
-  if (mode === 'monthly') list = all.filter(([,u]) => u.created && Date.now()-u.created < 30*DAY);
-  if (!['weekly','monthly','alltime','world','regional'].includes(mode))
-    return reply(msg, 'Use /leaderboard weekly, monthly, or alltime.');
-  if (mode === 'regional') {
-    const region = user(idOf(msg)).region;
-    list = all.filter(([,u]) => u.region === region);
+  if (scope === 'region') {
+    if (me.region === 'unset') return errorCard(msg, 'Set your region first with `/region region-name`.');
+    rows = rows.filter(([, u]) => u.region === me.region);
+  } else if (scope !== 'world') {
+    return errorCard(msg, 'Usage: `/leaderboard alltime|weekly|monthly world|region`.');
   }
-  list.sort((a,b) => (b[1].balance+b[1].bank)-(a[1].balance+a[1].bank));
-  const lines = list.slice(0,10).map(([id,u],i) =>
-    `${i+1}. ${id} — ${money(u.balance+u.bank)} Gems`);
-  return reply(msg, `🏆 ${mode.toUpperCase()} LEADERBOARD\n${lines.join('\n') || 'No players yet.'}`);
+
+  const cutoff = period === 'weekly' ? Date.now() - WEEK : period === 'monthly' ? Date.now() - MONTH : 0;
+  const score = u => period === 'alltime' ? u.balance :
+    (u.history || []).filter(h => h.at >= cutoff && h.delta > 0).reduce((s, h) => s + h.delta, 0);
+
+  rows.sort((a, b) => score(b[1]) - score(a[1]));
+  const top = rows.slice(0, 10);
+  if (!top.length) return errorCard(msg, 'No players on this leaderboard yet.');
+
+  return card(msg, `🏆 ${period.toUpperCase()} LEADERBOARD`,
+    top.map(([id, u], i) => `**${i + 1}.** <@${id}> — ${fmt(score(u))} Gems`).join('\n'));
 });
 
-bot.command('richest', 'Show richest players', msg =>
-  bot.commands.get('leaderboard').fn(msg)
-);
-
-bot.command('shop', 'View shop items', msg => {
-  const lines = Object.entries(ITEMS).map(([key,x]) =>
-    `• ${key} — ${x.name}: ${x.price} Gems`);
-  return reply(msg, `🛒 SHOP\n${lines.join('\n')}\nBuy with /buy item amount`);
+bot.command('richest', 'Show the richest players', msg => {
+  const top = Object.entries(db.users).sort((a, b) => b[1].balance - a[1].balance).slice(0, 10);
+  return card(msg, 'Richest Players',
+    top.length ? top.map(([id, u], i) => `**${i + 1}.** <@${id}> — ${fmt(u.balance)} Gems`).join('\n') : 'No balances yet.');
 });
 
-bot.command('buy', 'Buy an item', async msg => {
-  const [keyRaw, amountRaw] = msg.argv || [];
-  const key = (keyRaw || '').toLowerCase();
-  const amount = amountRaw === undefined ? 1 : Number(amountRaw);
-  const item = ITEMS[key];
-  if (!item || !Number.isSafeInteger(amount) || amount < 1 || amount > 100)
-    return reply(msg, 'Use /buy item amount. Check /shop.');
-  const u = user(idOf(msg));
-  const cost = item.price * amount;
-  if (u.balance < cost) return reply(msg, '❌ Not enough Gems.');
-  u.balance -= cost;
-  u.stats.spent += cost;
-  u.inventory[key] = (u.inventory[key] || 0) + amount;
+bot.command('region', 'Set your region: /region region-name', async msg => {
+  const name = args(msg).join(' ').toLowerCase();
+  const u = getUser(msg);
+  if (!name) return card(msg, 'Your Region', `🌍 Current region: **${u.region}**\nSet it with \`/region region-name\`.`);
+  if (name.length > 30) return errorCard(msg, 'Region name must be 30 characters or fewer.');
+  u.region = name;
   await save();
-  return reply(msg, `🛒 Bought ${amount} × ${item.name}.`);
+  return card(msg, 'Region Updated', `🌍 Your region is now **${name}**.`);
+});
+
+bot.command('profile', 'Show your economy profile', msg => {
+  const u = getUser(msg);
+  return card(msg, `${msg.author_username || msg.username || 'Player'}'s Profile`, 'Your Vaulty stats:', [
+    ['💎 Balance', `${fmt(u.balance)} Gems`, true],
+    ['🌍 Region', u.region, true],
+    ['🐾 Pets', u.pets.length, true],
+    ['🎒 Inventory types', Object.keys(u.inventory).length, true],
+    ['🏅 Achievements', u.achievements.length, true],
+    ['🎲 Games', `${u.stats.games} played • ${u.stats.wins} wins`]
+  ]);
+});
+
+// SHOP AND INVENTORY
+bot.command('shop', 'Browse shop items', msg => {
+  return card(msg, 'Gems Shop',
+    Object.entries(SHOP_ITEMS).map(([id, x]) =>
+      `**${x.name}** (\`${id}\`) — **${x.price} Gems**\n${x.description}`
+    ).join('\n\n') + '\n\nBuy with `/buy item quantity`.');
+});
+
+bot.command('buy', 'Buy an item: /buy item [quantity]', async msg => {
+  if (maintenanceBlocked(msg)) return errorCard(msg, 'The economy is in maintenance mode.');
+  const [keyRaw, qtyRaw] = args(msg);
+  const key = (keyRaw || '').toLowerCase();
+  const item = SHOP_ITEMS[key];
+  const qty = qtyRaw === undefined ? 1 : Number(qtyRaw);
+  if (!item || !Number.isSafeInteger(qty) || qty < 1 || qty > 100) return errorCard(msg, 'Usage: `/buy apple 2` (quantity 1–100).');
+  const u = getUser(msg);
+  const cost = item.price * qty;
+  if (u.balance < cost) return errorCard(msg, `You need ${fmt(cost)} Gems but have ${fmt(u.balance)}.`);
+  record(u, -cost);
+  u.inventory[key] = (u.inventory[key] || 0) + qty;
+  if (key === 'egg' || key === 'goldenegg') u.stats.discoveries.push(`Bought ${item.name}`);
+  await save();
+  return card(msg, 'Purchase Complete', `🛒 Bought **${qty} × ${item.name}** for **${fmt(cost)} Gems**.`, [
+    ['Remaining Balance', `${fmt(u.balance)} Gems`, true]
+  ]);
 });
 
 bot.command('inventory', 'View your items', msg => {
-  const inv = user(idOf(msg)).inventory;
-  const lines = Object.entries(inv).filter(([,n]) => n > 0)
-    .map(([key,n]) => `${key}: ${n}`);
-  return reply(msg, `🎒 INVENTORY\n${lines.join('\n') || 'Empty.'}`);
+  const u = getUser(msg);
+  const lines = Object.entries(u.inventory).filter(([, n]) => n > 0)
+    .map(([k, n]) => `• **${SHOP_ITEMS[k]?.name || k}** — ${n}`);
+  return card(msg, 'Your Inventory', lines.length ? lines.join('\n') : 'Your inventory is empty. Use `/shop` to buy items.');
 });
 
-bot.command('sell', 'Sell an item', async msg => {
-  const [keyRaw, amountRaw] = msg.argv || [];
+bot.command('sell', 'Sell an item: /sell item [quantity]', async msg => {
+  const [keyRaw, qtyRaw] = args(msg);
   const key = (keyRaw || '').toLowerCase();
-  const amount = amountRaw === undefined ? 1 : Number(amountRaw);
-  const item = ITEMS[key];
-  const u = user(idOf(msg));
-  if (!item || !Number.isSafeInteger(amount) || amount < 1)
-    return reply(msg, 'Use /sell item amount');
-  if ((u.inventory[key] || 0) < amount)
-    return reply(msg, '❌ You do not have enough.');
-  u.inventory[key] -= amount;
-  addGems(u, item.sell * amount);
+  const item = SHOP_ITEMS[key];
+  const qty = qtyRaw === undefined ? 1 : Number(qtyRaw);
+  const u = getUser(msg);
+  if (!item || !Number.isSafeInteger(qty) || qty < 1) return errorCard(msg, 'Usage: `/sell apple 1`.');
+  if ((u.inventory[key] || 0) < qty) return errorCard(msg, 'You do not have enough of that item.');
+  const value = Math.floor(item.price * 0.5) * qty;
+  u.inventory[key] -= qty;
+  record(u, value);
   await save();
-  return reply(msg, `💰 Sold ${amount} × ${item.name} for ${money(item.sell*amount)} Gems.`);
+  return card(msg, 'Item Sold', `💰 Sold **${qty} × ${item.name}** for **${fmt(value)} Gems**.`);
 });
 
-bot.command('use', 'Use an item', async msg => {
-  const key = (msg.argv?.[0] || '').toLowerCase();
-  const u = user(idOf(msg));
-  if (!ITEMS[key] || ITEMS[key].type !== 'use')
-    return reply(msg, 'That item cannot be used.');
-  if ((u.inventory[key] || 0) < 1) return reply(msg, 'You do not have that item.');
-  u.inventory[key]--;
-  if (key === 'potion') {
-    const prize = Math.floor(Math.random() * 101) + 50;
-    addGems(u, prize);
+bot.command('use', 'Use an item: /use item', async msg => {
+  const key = (args(msg)[0] || '').toLowerCase();
+  const u = getUser(msg);
+  if (!SHOP_ITEMS[key]) return errorCard(msg, 'Choose an item from `/inventory`.');
+  if ((u.inventory[key] || 0) < 1) return errorCard(msg, `You don't have any ${key}.`);
+
+  if (key === 'egg' || key === 'goldenegg') {
+    u.inventory[key]--;
+    const pet = weightedPick(EGG_TABLES[key]);
+    u.pets.push({ name: pet, at: Date.now() });
+    u.stats.discoveries.push(pet);
     await save();
-    return reply(msg, `🧪 Potion used! You found ${prize} Gems.`);
+    return card(msg, 'Egg Hatched!', `🥚 You discovered **${pet}**!`, [
+      ['Rarity', PETS[pet].rarity, true]
+    ]);
   }
-  const prize = Math.floor(Math.random() * 151);
-  addGems(u, prize);
+
+  u.inventory[key]--;
   await save();
-  return reply(msg, `🎟️ Ticket used! You won ${prize} Gems.`);
+  if (key === 'apple') return card(msg, 'Apple Used', '🍎 Delicious!');
+  if (key === 'potion') return card(msg, 'Potion Used', '🧪 The Lucky Potion sparkles, but has no gameplay effect yet.');
+  return card(msg, 'Item Used', `✨ You used ${SHOP_ITEMS[key].name}.`);
 });
 
-bot.command('eggs', 'See available eggs', msg =>
-  reply(msg, '🥚 Common Egg: 100 Gems\n🌟 Golden Egg: 500 Gems\nUse /buy egg or /buy goldenegg, then /hatch egg.')
-);
+// EGGS AND PETS
+bot.command('eggs', 'See eggs available in the shop', msg =>
+  card(msg, 'Eggs', '**Basic Egg** — 100 Gems\nCommon pets, with a chance of rare pets.\n\n**Golden Egg** — 500 Gems\nBetter chance of rarer pets.\n\nUse `/buy egg` or `/buy goldenegg`, then `/hatch`.'));
 
-bot.command('hatch', 'Hatch an egg', async msg => {
-  const key = (msg.argv?.[0] || 'egg').toLowerCase();
-  const u = user(idOf(msg));
-  if (!['egg','goldenegg'].includes(key)) return reply(msg, 'Use /hatch egg or /hatch goldenegg');
-  if ((u.inventory[key] || 0) < 1) return reply(msg, `Buy one first: /buy ${key}`);
+bot.command('hatch', 'Hatch an egg: /hatch [egg|goldenegg]', async msg => {
+  const key = (args(msg)[0] || 'egg').toLowerCase();
+  const u = getUser(msg);
+  if (!EGG_TABLES[key]) return errorCard(msg, 'Choose `egg` or `goldenegg`.');
+  if ((u.inventory[key] || 0) < 1) return errorCard(msg, `You need a ${SHOP_ITEMS[key].name}. Buy one with \`/buy ${key}\`.`);
   u.inventory[key]--;
-  const pet = pickPet();
-  if (key === 'goldenegg' && ['Common','Uncommon'].includes(pet.rarity)) {
-    pet.rarity = 'Rare';
-    pet.value = 250;
-  }
-  u.pets.push(pet);
-  if (!u.discoveries.includes(pet.name)) u.discoveries.push(pet.name);
-  const newAchievements = checkAchievements(u);
+  const pet = weightedPick(EGG_TABLES[key]);
+  u.pets.push({ name: pet, at: Date.now() });
+  u.stats.discoveries.push(pet);
+  const achievement = grantAchievement(u, `pet_${pet.toLowerCase()}`, `Discovered ${pet}`);
   await save();
-  return reply(msg, `🥚 You hatched a ${pet.rarity} ${pet.name}!\n${newAchievements.length ? '🏅 Achievement unlocked: '+newAchievements.join(', ') : ''}`);
+  return card(msg, 'Pet Discovered!', `🥚✨ You hatched **${pet}**!${achievement}`, [
+    ['Rarity', PETS[pet].rarity, true],
+    ['Sell Value', `${fmt(PETS[pet].value / 2)} Gems`, true]
+  ]);
 });
 
 bot.command('pets', 'List your pets', msg => {
-  const pets = user(idOf(msg)).pets;
-  return reply(msg, `🐾 YOUR PETS\n${pets.map((p,i)=>`${i+1}. ${p.rarity} ${p.name}`).join('\n') || 'No pets yet. Buy an egg and hatch it!'}`);
+  const u = getUser(msg);
+  return card(msg, 'Your Pets', u.pets.length
+    ? u.pets.map((p, i) => `**${i + 1}. ${p.name}** — ${PETS[p.name]?.rarity || 'Unknown'}`).join('\n')
+    : 'You have no pets yet. Buy an egg and use `/hatch`.');
 });
 
-bot.command('pet', 'View one pet', msg => {
-  const n = Number(msg.argv?.[0]);
-  const p = user(idOf(msg)).pets[n-1];
-  if (!p) return reply(msg, 'Use /pet number, e.g. /pet 1');
-  return reply(msg, `🐾 ${p.name}\nRarity: ${p.rarity}\nSell value: ${p.value} Gems`);
+bot.command('pet', 'View a pet: /pet number', msg => {
+  const u = getUser(msg);
+  const n = Number(args(msg)[0]);
+  if (!Number.isInteger(n) || n < 1 || n > u.pets.length) return errorCard(msg, 'Usage: `/pet 1` (check `/pets`).');
+  const p = u.pets[n - 1];
+  return card(msg, p.name, `🐾 **${p.name}**`, [
+    ['Rarity', PETS[p.name]?.rarity || 'Unknown', true],
+    ['Sell Value', `${fmt(Math.floor((PETS[p.name]?.value || 10) * 0.5))} Gems`, true]
+  ]);
 });
 
-bot.command('sellpet', 'Sell one pet', async msg => {
-  const n = Number(msg.argv?.[0]);
-  const u = user(idOf(msg));
-  const p = u.pets[n-1];
-  if (!p) return reply(msg, 'Use /sellpet number');
-  u.pets.splice(n-1, 1);
-  addGems(u, p.value);
+bot.command('sellpet', 'Sell a pet: /sellpet number', async msg => {
+  const u = getUser(msg);
+  const n = Number(args(msg)[0]);
+  if (!Number.isInteger(n) || n < 1 || n > u.pets.length) return errorCard(msg, 'Usage: `/sellpet 1` (check `/pets`).');
+  const p = u.pets.splice(n - 1, 1)[0];
+  const value = Math.floor((PETS[p.name]?.value || 10) * 0.5);
+  record(u, value);
   await save();
-  return reply(msg, `💰 Sold ${p.name} for ${p.value} Gems.`);
+  return card(msg, 'Pet Sold', `🐾 Sold **${p.name}** for **${fmt(value)} Gems**.`);
 });
 
-bot.command('collection', 'View your pet collection', msg => {
-  const u = user(idOf(msg));
-  return reply(msg, `📚 Collection\n${u.discoveries.join(', ') || 'No discoveries yet.'}`);
+bot.command('collection', 'Show your pet collection', msg => {
+  const u = getUser(msg);
+  const counts = {};
+  for (const p of u.pets) counts[p.name] = (counts[p.name] || 0) + 1;
+  return card(msg, 'Pet Collection', Object.keys(PETS).map(n =>
+    `${counts[n] ? '✅' : '⬜'} **${n}** (${PETS[n].rarity}) — ${counts[n] || 0} owned`
+  ).join('\n'));
 });
 
-bot.command('discoveries', 'View discovered pets', msg =>
-  bot.commands.get('collection').fn(msg)
+bot.command('petindex', 'View all pets and discoveries', msg => {
+  const u = getUser(msg);
+  const found = new Set(u.stats.discoveries);
+  const lines = Object.entries(PETS).map(([name, p]) =>
+    `${found.has(name) ? '✅' : '🔒'} **${found.has(name) ? name : '???'}** — ${p.rarity}`
+  );
+  const discovered = Object.keys(PETS).filter(n => found.has(n)).length;
+  return card(msg, 'Pet Index', `Collection progress: **${discovered}/${Object.keys(PETS).length}**\n\n${lines.join('\n')}`);
+});
+
+bot.command('discoveries', 'Show pets you have discovered', msg => {
+  const u = getUser(msg);
+  const found = [...new Set(u.stats.discoveries.filter(n => PETS[n]))];
+  return card(msg, 'Discoveries', found.length ? found.join(', ') : 'No pets discovered yet. Hatch an egg!');
+});
+
+// MINI-GAMES — fictional in-bot Gems only
+bot.command('coinflip', 'Bet Gems: /coinflip amount heads|tails', async msg => {
+  if (maintenanceBlocked(msg)) return errorCard(msg, 'The economy is in maintenance mode.');
+  const [rawAmount, choiceRaw] = args(msg);
+  const amount = Number(rawAmount);
+  const choice = (choiceRaw || '').toLowerCase();
+  const u = getUser(msg);
+  if (!Number.isSafeInteger(amount) || amount < 1 || amount > 1000 || !['heads', 'tails'].includes(choice))
+    return errorCard(msg, 'Usage: `/coinflip amount heads` (bet 1–1000 Gems).');
+  if (u.balance < amount) return errorCard(msg, "You don't have enough Gems.");
+  u.stats.games++;
+  const result = Math.random() < 0.5 ? 'heads' : 'tails';
+  if (result === choice) {
+    record(u, amount);
+    u.stats.wins++;
+    const achievement = grantAchievement(u, 'coinflip_win', 'Lucky Flip');
+    await save();
+    return card(msg, 'Coinflip Won!', `🪙 It landed **${result}**. You won **${fmt(amount)} Gems**!${achievement}`, [
+      ['Balance', `${fmt(u.balance)} Gems`, true]
+    ]);
+  }
+  record(u, -amount);
+  await save();
+  return card(msg, 'Coinflip Lost', `🪙 It landed **${result}**. You lost **${fmt(amount)} Gems**.`, [
+    ['Balance', `${fmt(u.balance)} Gems`, true]
+  ]);
+});
+
+bot.command('slots', 'Bet Gems: /slots amount', async msg => {
+  if (maintenanceBlocked(msg)) return errorCard(msg, 'The economy is in maintenance mode.');
+  const amount = Number(args(msg)[0]);
+  const u = getUser(msg);
+  if (!Number.isSafeInteger(amount) || amount < 1 || amount > 500) return errorCard(msg, 'Usage: `/slots amount` (1–500 Gems).');
+  if (u.balance < amount) return errorCard(msg, "You don't have enough Gems.");
+  u.stats.games++;
+  const icons = ['🍒', '🍋', '🍇', '⭐', '💎'];
+  const r = [0, 0, 0].map(() => icons[Math.floor(Math.random() * icons.length)]);
+  if (r[0] === r[1] && r[1] === r[2]) {
+    const win = amount * 4;
+    record(u, win);
+    u.stats.wins++;
+    const achievement = grantAchievement(u, 'slots_win', 'Jackpot');
+    await save();
+    return card(msg, 'JACKPOT!', `${r.join(' | ')}\n🎉 Triple match! You won **${fmt(win)} Gems**!${achievement}`, [
+      ['Balance', `${fmt(u.balance)} Gems`, true]
+    ]);
+  }
+  if (r[0] === r[1] || r[1] === r[2] || r[0] === r[2]) {
+    const win = Math.floor(amount * 0.5);
+    record(u, win);
+    await save();
+    return card(msg, 'Pair!', `${r.join(' | ')}\n✨ You won back **${fmt(win)} Gems**.`, [
+      ['Balance', `${fmt(u.balance)} Gems`, true]
+    ]);
+  }
+  record(u, -amount);
+  await save();
+  return card(msg, 'No Match', `${r.join(' | ')}\nYou lost **${fmt(amount)} Gems**.`, [
+    ['Balance', `${fmt(u.balance)} Gems`, true]
+  ]);
+});
+
+// ACHIEVEMENTS AND HELP
+bot.command('achievements', 'View your achievements', msg => {
+  const u = getUser(msg);
+  const all = [
+    ['first_daily', 'Daily Starter'],
+    ['first_work', 'Hard Worker'],
+    ['coinflip_win', 'Lucky Flip'],
+    ['slots_win', 'Jackpot'],
+    ...Object.keys(PETS).map(n => [`pet_${n.toLowerCase()}`, `Discovered ${n}`])
+  ];
+  return card(msg, 'Achievements', all.map(([k, n]) =>
+    `${u.achievements.includes(k) ? '✅' : '⬜'} ${n}`
+  ).join('\n'));
+});
+
+bot.command('help', 'List all bot commands', msg =>
+  card(msg, 'Vaulty Commands',
+    '**Economy**\n/balance • /daily • /weekly • /work • /transfer • /profile\n\n' +
+    '**Leaderboards**\n/leaderboard • /richest • /region\n\n' +
+    '**Pets**\n/eggs • /hatch • /pets • /pet • /sellpet • /collection • /petindex • /discoveries\n\n' +
+    '**Shop**\n/shop • /buy • /inventory • /sell • /use\n\n' +
+    '**Games**\n/coinflip • /slots\n\n' +
+    '**Progress**\n/achievements • /ping\n\n' +
+    '**Admin**\n/addgems • /removegems • /setgems • /giveegg • /maintenance'
+  )
 );
 
-bot.command('coinflip', 'Bet Gems on a coin flip', async msg => {
-  const amount = Number(msg.argv?.[0]);
-  const choice = (msg.argv?.[1] || '').toLowerCase();
-  const u = user(idOf(msg));
-  if (!Number.isSafeInteger(amount) || amount < 1 || !['heads','tails'].includes(choice))
-    return reply(msg, 'Use /coinflip amount heads|tails');
-  if (u.balance < amount) return reply(msg, 'Not enough Gems.');
-  if (Math.random() < 0.5) {
-    u.balance -= amount;
-    u.stats.spent += amount;
-    await save();
-    return reply(msg, `🪙 It was ${choice === 'heads' ? 'tails' : 'heads'}! You lost ${amount} Gems.`);
-  }
-  addGems(u, amount);
+bot.command('ping', 'Check whether the bot is online', msg =>
+  card(msg, 'Pong!', '🏓 Vaulty is online.')
+);
+
+// ADMIN COMMANDS
+bot.command('addgems', 'Admin: /addgems @user amount', async msg => {
+  if (!isAdmin(msg)) return errorCard(msg, 'You are not authorised to use this command.');
+  const [raw, nRaw] = args(msg);
+  const id = targetId(raw);
+  const n = Number(nRaw);
+  if (!id || !Number.isSafeInteger(n) || n < 1 || n > 1000000000) return errorCard(msg, 'Usage: `/addgems @user amount`.');
+  const u = userFor(id);
+  record(u, n);
   await save();
-  return reply(msg, `🪙 It was ${choice}! You won ${amount} Gems.`);
+  return card(msg, 'Gems Added', `Added **${fmt(n)} Gems** to <@${id}>.`);
 });
 
-bot.command('slots', 'Play slots', async msg => {
-  const amount = Number(msg.argv?.[0]);
-  const u = user(idOf(msg));
-  if (!Number.isSafeInteger(amount) || amount < 1) return reply(msg, 'Use /slots amount');
-  if (u.balance < amount) return reply(msg, 'Not enough Gems.');
-  const icons = ['🍒','🍋','🔔','💎','⭐'];
-  const result = [0,1,2].map(()=>icons[Math.floor(Math.random()*icons.length)]);
-  let winnings = 0;
-  if (result[0] === result[1] && result[1] === result[2]) winnings = amount * 4;
-  else if (new Set(result).size < 3) winnings = amount * 2;
-  u.balance -= amount;
-  u.stats.spent += amount;
-  if (winnings) addGems(u, winnings);
+bot.command('removegems', 'Admin: /removegems @user amount', async msg => {
+  if (!isAdmin(msg)) return errorCard(msg, 'You are not authorised to use this command.');
+  const [raw, nRaw] = args(msg);
+  const id = targetId(raw);
+  const n = Number(nRaw);
+  if (!id || !Number.isSafeInteger(n) || n < 1 || n > 1000000000) return errorCard(msg, 'Usage: `/removegems @user amount`.');
+  const u = userFor(id);
+  record(u, -Math.min(n, u.balance));
   await save();
-  return reply(msg, `${result.join(' | ')}\n${winnings ? `🎉 Won ${winnings} Gems!` : 'No win this time.'}`);
+  return card(msg, 'Gems Removed', `Removed up to **${fmt(n)} Gems** from <@${id}>.`);
 });
 
-bot.command('achievements', 'View achievements', msg => {
-  const u = user(idOf(msg));
-  const unlocked = checkAchievements(u);
-  save();
-  return reply(msg, `🏅 ACHIEVEMENTS\n${u.achievements.join('\n') || 'None yet.'}${unlocked.length ? '\nNew: '+unlocked.join(', ') : ''}`);
-});
-
-bot.command('addgems', 'Admin: add Gems', async msg => {
-  if (!isAdmin(msg)) return reply(msg, '⛔ Admin only.');
-  const [targetRaw, amountRaw] = msg.argv || [];
-  const amount = Number(amountRaw);
-  const target = mentionId(targetRaw);
-  if (!target || !Number.isSafeInteger(amount) || amount <= 0) return reply(msg, 'Use /addgems @user amount');
-  addGems(user(target), amount);
+bot.command('setgems', 'Admin: /setgems @user amount', async msg => {
+  if (!isAdmin(msg)) return errorCard(msg, 'You are not authorised to use this command.');
+  const [raw, nRaw] = args(msg);
+  const id = targetId(raw);
+  const n = Number(nRaw);
+  if (!id || !Number.isSafeInteger(n) || n < 0 || n > 1000000000) return errorCard(msg, 'Usage: `/setgems @user amount`.');
+  const u = userFor(id);
+  record(u, n - u.balance);
   await save();
-  return reply(msg, `✅ Added ${amount} Gems to ${target}.`);
+  return card(msg, 'Balance Set', `Set <@${id}>'s balance to **${fmt(n)} Gems**.`);
 });
 
-bot.command('removegems', 'Admin: remove Gems', async msg => {
-  if (!isAdmin(msg)) return reply(msg, '⛔ Admin only.');
-  const [targetRaw, amountRaw] = msg.argv || [];
-  const amount = Number(amountRaw);
-  const target = mentionId(targetRaw);
-  if (!target || !Number.isSafeInteger(amount) || amount <= 0) return reply(msg, 'Use /removegems @user amount');
-  const u = user(target);
-  u.balance = Math.max(0, u.balance - amount);
+bot.command('giveegg', 'Admin: /giveegg @user [egg|goldenegg]', async msg => {
+  if (!isAdmin(msg)) return errorCard(msg, 'You are not authorised to use this command.');
+  const [raw, kindRaw] = args(msg);
+  const id = targetId(raw);
+  const kind = (kindRaw || 'egg').toLowerCase();
+  if (!id || !EGG_TABLES[kind]) return errorCard(msg, 'Usage: `/giveegg @user egg` or `/giveegg @user goldenegg`.');
+  const u = userFor(id);
+  u.inventory[kind] = (u.inventory[kind] || 0) + 1;
   await save();
-  return reply(msg, `✅ Removed Gems from ${target}.`);
+  return card(msg, 'Egg Granted', `🥚 Gave a **${SHOP_ITEMS[kind].name}** to <@${id}>.`);
 });
 
-bot.command('setgems', 'Admin: set balance', async msg => {
-  if (!isAdmin(msg)) return reply(msg, '⛔ Admin only.');
-  const [targetRaw, amountRaw] = msg.argv || [];
-  const amount = Number(amountRaw);
-  const target = mentionId(targetRaw);
-  if (!target || !Number.isSafeInteger(amount) || amount < 0) return reply(msg, 'Use /setgems @user amount');
-  user(target).balance = amount;
+bot.command('maintenance', 'Admin: /maintenance on|off', async msg => {
+  if (!isAdmin(msg)) return errorCard(msg, 'You are not authorised to use this command.');
+  const v = (args(msg)[0] || '').toLowerCase();
+  if (!['on', 'off'].includes(v))
+    return card(msg, 'Maintenance', `Current status: **${db.maintenance ? 'ON' : 'OFF'}**\nUse \`/maintenance on\` or \`/maintenance off\`.`);
+  db.maintenance = v === 'on';
   await save();
-  return reply(msg, `✅ Set ${target}'s balance to ${amount} Gems.`);
+  return card(msg, 'Maintenance Updated', `🔧 Maintenance mode is now **${v.toUpperCase()}**.`);
 });
 
-bot.command('giveegg', 'Admin: give an egg', async msg => {
-  if (!isAdmin(msg)) return reply(msg, '⛔ Admin only.');
-  const [targetRaw, typeRaw] = msg.argv || [];
-  const target = mentionId(targetRaw);
-  const type = (typeRaw || 'egg').toLowerCase();
-  if (!target || !['egg','goldenegg'].includes(type)) return reply(msg, 'Use /giveegg @user [egg|goldenegg]');
-  const u = user(target);
-  u.inventory[type] = (u.inventory[type] || 0) + 1;
-  await save();
-  return reply(msg, `🥚 Gave ${type} to ${target}.`);
-});
+bot.on('error', err => console.error('[Vaulty]', err?.message || err));
 
-bot.command('maintenance', 'Admin: toggle maintenance', async msg => {
-  if (!isAdmin(msg)) return reply(msg, '⛔ Admin only.');
-  const mode = (msg.argv?.[0] || '').toLowerCase();
-  if (!['on','off'].includes(mode)) return reply(msg, 'Use /maintenance on or /maintenance off');
-  db.maintenance = mode === 'on';
-  await save();
-  return reply(msg, `🔧 Maintenance ${mode}.`);
-});
-
-bot.on('error', err => console.error('Bot error:', err));
 bot.start();
+
