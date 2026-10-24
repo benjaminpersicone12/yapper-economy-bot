@@ -66,9 +66,13 @@ function addGems(u, amount) {
   if (amount > 0) u.stats.earned += amount;
 }
 function cooldownMessage(last, duration) {
-  const left = duration - (Date.now() - last);
-  if (left <= 0) return null;
-  return `⏳ Try again in ${Math.ceil(left / HOUR)} hour(s).`;
+  const timestamp = Number(last) || 0;
+  const wait = duration - (Date.now() - timestamp);
+
+  if (wait <= 0) return null;
+
+  const hours = Math.ceil(wait / 3600000);
+  return `⏳ Try again in ${hours} hour(s).`;
 }
 
 const ITEMS = {
