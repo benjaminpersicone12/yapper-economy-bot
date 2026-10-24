@@ -1,4 +1,5 @@
 
+
 import { Bot, Embed } from './yapper.js';
 import { readFile, writeFile } from 'node:fs/promises';
 
@@ -234,21 +235,12 @@ bot.command('transfer', 'Transfer Gems: /transfer @user amount', async msg => {
   return card(msg, 'Transfer Complete', `💸 Sent **${fmt(amount)} Gems** to <@${id}>.`);
 });
 
-// LEADERBOARDS
-bot.command('leaderboard', 'Usage: /leaderboard alltime|weekly|monthly world|region', msg => {
+// LEADERBOARD — worldwide only
+bot.command('leaderboard', 'Usage: /leaderboard [alltime|weekly|monthly]', msg => {
   const a = args(msg);
   const period = ['weekly', 'monthly', 'alltime'].includes((a[0] || '').toLowerCase())
     ? a[0].toLowerCase() : 'alltime';
-  const scope = (a[1] || 'world').toLowerCase();
-  const me = getUser(msg);
-  let rows = Object.entries(db.users);
-
-  if (scope === 'region') {
-    if (me.region === 'unset') return errorCard(msg, 'Set your region first with `/region region-name`.');
-    rows = rows.filter(([, u]) => u.region === me.region);
-  } else if (scope !== 'world') {
-    return errorCard(msg, 'Usage: `/leaderboard alltime|weekly|monthly world|region`.');
-  }
+  const rows = Object.entries(db.users);
 
   const cutoff = period === 'weekly' ? Date.now() - WEEK : period === 'monthly' ? Date.now() - MONTH : 0;
   const score = u => period === 'alltime' ? u.balance :
@@ -260,22 +252,6 @@ bot.command('leaderboard', 'Usage: /leaderboard alltime|weekly|monthly world|reg
 
   return card(msg, `🏆 ${period.toUpperCase()} LEADERBOARD`,
     top.map(([id, u], i) => `**${i + 1}.** <@${id}> — ${fmt(score(u))} Gems`).join('\n'));
-});
-
-bot.command('richest', 'Show the richest players', msg => {
-  const top = Object.entries(db.users).sort((a, b) => b[1].balance - a[1].balance).slice(0, 10);
-  return card(msg, 'Richest Players',
-    top.length ? top.map(([id, u], i) => `**${i + 1}.** <@${id}> — ${fmt(u.balance)} Gems`).join('\n') : 'No balances yet.');
-});
-
-bot.command('region', 'Set your region: /region region-name', async msg => {
-  const name = args(msg).join(' ').toLowerCase();
-  const u = getUser(msg);
-  if (!name) return card(msg, 'Your Region', `🌍 Current region: **${u.region}**\nSet it with \`/region region-name\`.`);
-  if (name.length > 30) return errorCard(msg, 'Region name must be 30 characters or fewer.');
-  u.region = name;
-  await save();
-  return card(msg, 'Region Updated', `🌍 Your region is now **${name}**.`);
 });
 
 bot.command('profile', 'Show your economy profile', msg => {
@@ -319,9 +295,10 @@ bot.command('buy', 'Buy an item: /buy item [quantity]', async msg => {
 
 bot.command('inventory', 'View your items', msg => {
   const u = getUser(msg);
-  const lines = Object.entries(u.inventory).filter(([, n]) => n > 0)
-    .map(([k, n]) => `• **${SHOP_ITEMS[k]?.name || k}** — ${n}`);
-  return card(msg, 'Your Inventory', lines.length ? lines.join('\n') : 'Your inventory is empty. Use `/shop` to buy items.');
+  const lines = Object.entries(u.inventory)
+    .filter(([, qty]) => qty > 0)
+    .map(([key, qty]) => `**${SHOP_ITEMS[key]?.name || key}** — ${qty}`);
+  return card(msg, 'Your Inventory', lines.length ? lines.join('\n') : 'Your inventory is empty.');
 });
 
 bot.command('sell', 'Sell an item: /sell item [quantity]', async msg => {
@@ -384,17 +361,10 @@ bot.command('hatch', 'Hatch an egg: /hatch [egg|goldenegg]', async msg => {
   ]);
 });
 
-bot.command('pets', 'List your pets', msg => {
-  const u = getUser(msg);
-  return card(msg, 'Your Pets', u.pets.length
-    ? u.pets.map((p, i) => `**${i + 1}. ${p.name}** — ${PETS[p.name]?.rarity || 'Unknown'}`).join('\n')
-    : 'You have no pets yet. Buy an egg and use `/hatch`.');
-});
-
 bot.command('pet', 'View a pet: /pet number', msg => {
   const u = getUser(msg);
   const n = Number(args(msg)[0]);
-  if (!Number.isInteger(n) || n < 1 || n > u.pets.length) return errorCard(msg, 'Usage: `/pet 1` (check `/pets`).');
+  if (!Number.isInteger(n) || n < 1 || n > u.pets.length) return errorCard(msg, 'Usage: `/pet 1` (check `/collection`).');
   const p = u.pets[n - 1];
   return card(msg, p.name, `🐾 **${p.name}**`, [
     ['Rarity', PETS[p.name]?.rarity || 'Unknown', true],
@@ -405,7 +375,7 @@ bot.command('pet', 'View a pet: /pet number', msg => {
 bot.command('sellpet', 'Sell a pet: /sellpet number', async msg => {
   const u = getUser(msg);
   const n = Number(args(msg)[0]);
-  if (!Number.isInteger(n) || n < 1 || n > u.pets.length) return errorCard(msg, 'Usage: `/sellpet 1` (check `/pets`).');
+  if (!Number.isInteger(n) || n < 1 || n > u.pets.length) return errorCard(msg, 'Usage: `/sellpet 1` (check `/collection`).');
   const p = u.pets.splice(n - 1, 1)[0];
   const value = Math.floor((PETS[p.name]?.value || 10) * 0.5);
   record(u, value);
@@ -420,22 +390,6 @@ bot.command('collection', 'Show your pet collection', msg => {
   return card(msg, 'Pet Collection', Object.keys(PETS).map(n =>
     `${counts[n] ? '✅' : '⬜'} **${n}** (${PETS[n].rarity}) — ${counts[n] || 0} owned`
   ).join('\n'));
-});
-
-bot.command('petindex', 'View all pets and discoveries', msg => {
-  const u = getUser(msg);
-  const found = new Set(u.stats.discoveries);
-  const lines = Object.entries(PETS).map(([name, p]) =>
-    `${found.has(name) ? '✅' : '🔒'} **${found.has(name) ? name : '???'}** — ${p.rarity}`
-  );
-  const discovered = Object.keys(PETS).filter(n => found.has(n)).length;
-  return card(msg, 'Pet Index', `Collection progress: **${discovered}/${Object.keys(PETS).length}**\n\n${lines.join('\n')}`);
-});
-
-bot.command('discoveries', 'Show pets you have discovered', msg => {
-  const u = getUser(msg);
-  const found = [...new Set(u.stats.discoveries.filter(n => PETS[n]))];
-  return card(msg, 'Discoveries', found.length ? found.join(', ') : 'No pets discovered yet. Hatch an egg!');
 });
 
 // MINI-GAMES — fictional in-bot Gems only
@@ -500,35 +454,16 @@ bot.command('slots', 'Bet Gems: /slots amount', async msg => {
   ]);
 });
 
-// ACHIEVEMENTS AND HELP
-bot.command('achievements', 'View your achievements', msg => {
-  const u = getUser(msg);
-  const all = [
-    ['first_daily', 'Daily Starter'],
-    ['first_work', 'Hard Worker'],
-    ['coinflip_win', 'Lucky Flip'],
-    ['slots_win', 'Jackpot'],
-    ...Object.keys(PETS).map(n => [`pet_${n.toLowerCase()}`, `Discovered ${n}`])
-  ];
-  return card(msg, 'Achievements', all.map(([k, n]) =>
-    `${u.achievements.includes(k) ? '✅' : '⬜'} ${n}`
-  ).join('\n'));
-});
-
+// HELP
 bot.command('help', 'List all bot commands', msg =>
   card(msg, 'Vaulty Commands',
     '**Economy**\n/balance • /daily • /weekly • /work • /transfer • /profile\n\n' +
-    '**Leaderboards**\n/leaderboard • /richest • /region\n\n' +
-    '**Pets**\n/eggs • /hatch • /pets • /pet • /sellpet • /collection • /petindex • /discoveries\n\n' +
+    '**Leaderboard**\n/leaderboard\n\n' +
+    '**Pets**\n/eggs • /hatch • /pet • /sellpet • /collection\n\n' +
     '**Shop**\n/shop • /buy • /inventory • /sell • /use\n\n' +
     '**Games**\n/coinflip • /slots\n\n' +
-    '**Progress**\n/achievements • /ping\n\n' +
     '**Admin**\n/addgems • /removegems • /setgems • /giveegg • /maintenance'
   )
-);
-
-bot.command('ping', 'Check whether the bot is online', msg =>
-  card(msg, 'Pong!', '🏓 Vaulty is online.')
 );
 
 // ADMIN COMMANDS
@@ -593,4 +528,3 @@ bot.command('maintenance', 'Admin: /maintenance on|off', async msg => {
 bot.on('error', err => console.error('[Vaulty]', err?.message || err));
 
 bot.start();
-
