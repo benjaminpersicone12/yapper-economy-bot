@@ -1,5 +1,5 @@
 
-import { Bot } from './yapper.js';
+import { Bot, Embed } from './yapper.js';
 import { readFile, writeFile } from 'node:fs/promises';
 
 const bot = new Bot(process.env.YAPPER_BOT_TOKEN);
